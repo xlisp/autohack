@@ -1,24 +1,33 @@
 """
 hack.py — the mutable scanner. THIS IS THE FILE THE AGENT EDITS.
 
-Baseline behaviour (pass 1):
-  1. resolve target directory
-  2. parse every manifest under it (npm/pypi/cargo/go/...)
-  3. grep source for HTTP-client call sites (fetch/axios/requests/...)
-  4. union: every dependency that looks like an external SaaS SDK, plus every
-     remote host extracted from a URL string literal
-  5. write a row to findings/apis.tsv, write one stub findings/apis/<slug>.md
-     per discovery, print the summary
+Two target modes (auto-detected by prepare.target()):
 
-This baseline is intentionally shallow. The agent's job is to extend it pass
-by pass — add ecosystems (composer, gradle, terraform), add HTTP-client
-libraries, add env-var attribution, add config-file scanning (yaml/toml/k8s),
-add doc-mining (via WebFetch from the agent loop, not from here), tighten
-scoring, drop noisy false positives.
+  codebase mode (target is a directory)
+    1. parse every manifest (npm/pypi/cargo/go/...)
+    2. grep source for HTTP-client call sites (fetch/axios/requests/...)
+    3. union: every dep that looks like an external SaaS SDK, plus every
+       remote host extracted from a URL string literal
+    4. write findings/apis/<slug>.md stubs; agent later WebFetches docs
 
-The pass interface is stable:
-  - read target from prepare.target_dir()
-  - end with prepare.print_summary(...)
+  endpoint mode (target is an http(s):// URL)
+    1. poll the well-known discovery endpoints (OpenAPI / OIDC / OAuth /
+       JWKS / robots.txt / sitemap.xml) via prepare.ProbeSession — polite
+       only, no auth headers ever, capped at PROBE_BUDGET_PER_HOST requests
+    2. parse the OpenAPI doc if present -> enumerate paths + auth schemes
+    3. parse the OIDC config if present -> identify authorization_endpoint,
+       token_endpoint, jwks_uri, supported scopes/grant types
+    4. read TLS SAN list -> sibling hostnames worth a follow-up pass
+    5. record HTTP response headers (WWW-Authenticate, X-RateLimit-*,
+       CORS-related) — they reveal the auth scheme without trying any creds
+    6. agent then loop-step searches the public web (WebSearch / WebFetch)
+       for "<host> API documentation" and for callers (github code search,
+       grep.app, sourcegraph) and writes them into the per-API report
+
+The pass interface is stable: end with prepare.print_summary(...). The agent
+extends heuristics pass by pass. Adding new active probes BEYOND the
+prepare.WELL_KNOWN_PATHS allowlist is FORBIDDEN — that would turn polite
+recon into fuzzing.
 """
 
 from __future__ import annotations
@@ -156,7 +165,7 @@ def canonicalize_host(host: str) -> str | None:
     return None
 
 
-# ---------- one scan pass ----------
+# ---------- one scan pass (codebase mode) ----------
 
 def scan(target: Path, pass_no: int) -> tuple[int, int, int, int, int, float]:
     """Returns (new_apis, total_apis, endpoints_found, docs_mined, files_scanned, coverage_pct)."""
@@ -270,18 +279,164 @@ def write_coverage(manifests: list[prepare.ManifestEntry],
     prepare.COVERAGE_PATH.write_text("\n".join(lines) + "\n")
 
 
+# ---------- one scan pass (endpoint mode) ----------
+
+def scan_endpoint(base_url: str, pass_no: int) -> tuple[int, int, int, int, int, float]:
+    """Polite recon of a remote API. Returns the same tuple shape as scan()
+    so the caller's summary code doesn't care which mode ran."""
+    from urllib.parse import urlparse
+    host = urlparse(base_url).hostname or base_url
+    canonical = host
+
+    discoveries: dict[str, Discovery] = {}
+    d = Discovery(canonical=canonical)
+    discoveries[canonical] = d
+
+    endpoints_found = 0
+    docs_mined = 0
+    files_scanned = 0  # repurposed: number of probes sent
+
+    with prepare.ProbeSession() as sess:
+        # 1) base URL: HEAD then OPTIONS — surfaces auth scheme via headers.
+        for method in ("HEAD", "OPTIONS"):
+            r = sess.request(method, base_url)
+            files_scanned += 1
+            if r.error:
+                d.evidence.append(f"{method} {base_url} -> error: {r.error}")
+                continue
+            d.evidence.append(f"{method} {base_url} -> {r.status}")
+            _record_auth_hints(d, r.headers)
+
+        # 2) well-known discovery endpoints.
+        for r in prepare.probe_well_known(sess, base_url):
+            files_scanned += 1
+            d.sources.add(f"well-known:{urlparse(r.url).path}")
+            d.evidence.append(f"GET {r.url} -> {r.status} ({len(r.body_preview)}B)")
+            _ingest_well_known(d, r)
+            endpoints_found += _count_paths_from(r)
+
+        # 3) TLS SAN list -> sibling hosts (record only; agent decides whether
+        # to schedule follow-up passes against them, with explicit user OK).
+        for san in prepare.tls_san_names(host):
+            d.evidence.append(f"tls-san: {san}")
+
+    # Write the report stub. Doc mining (WebFetch on the docs URL we found)
+    # happens in the agent's loop step, not here.
+    body = render_endpoint_stub(d, base_url)
+    prepare.write_api_report(prepare.slugify(canonical), body)
+
+    coverage_pct = 100.0 if d.sources else 0.0
+    new_apis = 1
+    total_apis = 1
+    return new_apis, total_apis, endpoints_found, docs_mined, files_scanned, coverage_pct
+
+
+# Header names that announce the auth scheme without us trying any creds.
+_AUTH_HEADER_HINTS = {
+    "www-authenticate": "challenge",
+    "x-api-key": "api-key-header",
+    "x-amz-security-token": "aws-sigv4",
+    "x-goog-api-key": "google-api-key",
+}
+
+
+def _record_auth_hints(d: Discovery, headers: dict[str, str]) -> None:
+    lower = {k.lower(): v for k, v in headers.items()}
+    for name, label in _AUTH_HEADER_HINTS.items():
+        if name in lower:
+            d.env_vars.add(f"{label}={lower[name][:80]}")
+
+
+def _ingest_well_known(d: Discovery, r) -> None:
+    """Parse the body of a well-known response — OpenAPI or OIDC."""
+    text = r.body_preview
+    path = urlparse(r.url).path
+    if "openapi" in path or "swagger" in path or path.endswith("/api-docs"):
+        spec = _try_json(text)
+        if not spec:
+            return
+        # OpenAPI auth schemes
+        comps = (spec.get("components") or {}).get("securitySchemes") or {}
+        for name, scheme in comps.items():
+            kind = scheme.get("type", "?")
+            d.env_vars.add(f"openapi-security:{name}:{kind}")
+        # Paths
+        for p in (spec.get("paths") or {}):
+            d.endpoints.add(p)
+    elif path.endswith("openid-configuration") or path.endswith("oauth-authorization-server"):
+        spec = _try_json(text)
+        if not spec:
+            return
+        for key in ("authorization_endpoint", "token_endpoint", "jwks_uri",
+                    "issuer", "userinfo_endpoint", "revocation_endpoint"):
+            v = spec.get(key)
+            if v:
+                d.env_vars.add(f"oidc:{key}={v}")
+        for key in ("grant_types_supported", "scopes_supported",
+                    "response_types_supported"):
+            vals = spec.get(key)
+            if isinstance(vals, list):
+                d.env_vars.add(f"oidc:{key}=" + ",".join(map(str, vals[:8])))
+
+
+def _try_json(text: str) -> dict | None:
+    import json
+    try:
+        v = json.loads(text)
+        return v if isinstance(v, dict) else None
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _count_paths_from(r) -> int:
+    if not r.body_preview:
+        return 0
+    spec = _try_json(r.body_preview)
+    if not spec:
+        return 0
+    return len(spec.get("paths") or {})
+
+
+def render_endpoint_stub(d: Discovery, base_url: str) -> str:
+    lines = [f"# {d.canonical}", ""]
+    lines.append(f"- **Base URL**: {base_url}")
+    lines.append(f"- **Discovery sources**: {', '.join(sorted(d.sources)) or '—'}")
+    lines.append(f"- **Auth hints**: {', '.join(sorted(d.env_vars)) or '—'}")
+    lines.append(f"- **Docs**: _to be auto-mined by the agent loop_")
+    lines.append(f"- **Callers in the wild**: _to be auto-mined (WebSearch / code search) by the agent_")
+    lines.append("")
+    if d.endpoints:
+        lines.append("## Paths (from OpenAPI)")
+        for ep in sorted(d.endpoints):
+            lines.append(f"- `{ep}`")
+        lines.append("")
+    lines.append("## Probe log")
+    for ev in d.evidence:
+        lines.append(f"- {ev}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 # ---------- entrypoint ----------
 
 def main() -> None:
     prepare.ensure_findings_dirs()
-    target = prepare.target_dir()
+    tgt = prepare.target()
 
     # Pass number is read from the existing TSV (header + N data rows -> next is N+1).
     existing = prepare.TSV_PATH.read_text().splitlines()
     pass_no = max(1, len(existing))  # header counts as "0 data rows" -> first pass is 1
 
     t0 = time.monotonic()
-    new_apis, total_apis, endpoints_found, docs_mined, files_scanned, coverage_pct = scan(target, pass_no)
+    if tgt.mode == "codebase":
+        assert tgt.path is not None
+        result = scan(tgt.path, pass_no)
+    elif tgt.mode == "endpoint":
+        assert tgt.url is not None
+        result = scan_endpoint(tgt.url, pass_no)
+    else:
+        sys.exit(f"unknown target mode: {tgt.mode}")
+    new_apis, total_apis, endpoints_found, docs_mined, files_scanned, coverage_pct = result
     elapsed = time.monotonic() - t0
 
     prepare.print_summary(
@@ -297,4 +452,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import sys  # used in main() for the unknown-mode branch
     main()

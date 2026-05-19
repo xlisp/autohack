@@ -2,10 +2,13 @@
 prepare.py — fixed utilities for autohack. DO NOT MODIFY.
 
 Provides:
-- target discovery (TARGET_DIR / target.txt)
+- target discovery (TARGET_DIR / target.txt) — resolves to either a local
+  codebase path OR a remote API URL
 - manifest parsers (package.json, requirements.txt, pyproject.toml, go.mod,
   Cargo.toml, Gemfile, composer.json, pom.xml, build.gradle)
 - file walker with extension / size filters
+- polite HTTP probes for endpoint mode (well-known files, HEAD, OPTIONS) —
+  hard-capped request budget, fixed User-Agent, no credentials ever
 - structured writers for findings/apis.tsv and findings/apis/<slug>.md
 - redaction helper for accidentally-grepped secrets
 
@@ -18,10 +21,18 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
+import ssl
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Iterable, Iterator
+from urllib.parse import urlparse, urljoin
+
+try:
+    import httpx
+except ImportError:  # endpoint mode is optional; codebase mode still works
+    httpx = None  # type: ignore[assignment]
 
 REPO_ROOT = Path(__file__).resolve().parent
 FINDINGS_DIR = REPO_ROOT / "findings"
@@ -57,24 +68,51 @@ SKIP_FILE_PATTERNS = (".min.js", ".min.css", ".map", "-lock.json", ".lock")
 
 # ---------- target discovery ----------
 
+@dataclass
+class Target:
+    mode: str            # "codebase" or "endpoint"
+    path: Path | None    # set when mode == "codebase"
+    url: str | None      # set when mode == "endpoint" — the canonical base URL
+
+
+def _looks_like_url(s: str) -> bool:
+    return s.startswith(("http://", "https://"))
+
+
+def target() -> Target:
+    """Resolve the target. Prefer $TARGET_DIR, then target.txt. A value that
+    starts with http(s):// switches to endpoint mode."""
+    raw = os.environ.get("TARGET_DIR")
+    if not raw:
+        txt = REPO_ROOT / "target.txt"
+        if txt.is_file():
+            raw = txt.read_text().strip()
+    if not raw:
+        sys.exit(
+            "No target configured. Set $TARGET_DIR or write a path / URL "
+            "into target.txt at the repo root."
+        )
+
+    if _looks_like_url(raw):
+        parsed = urlparse(raw)
+        if not parsed.netloc:
+            sys.exit(f"target {raw!r} looks like a URL but has no host")
+        # Canonicalize: scheme + host + path-prefix (drop query/fragment).
+        base = f"{parsed.scheme}://{parsed.netloc}{parsed.path or ''}".rstrip("/")
+        return Target(mode="endpoint", path=None, url=base)
+
+    p = Path(raw).expanduser().resolve()
+    if not p.is_dir():
+        sys.exit(f"target {raw!r} is neither a URL nor an existing directory")
+    return Target(mode="codebase", path=p, url=None)
+
+
 def target_dir() -> Path:
-    """Resolve the target directory. Prefer $TARGET_DIR, then target.txt."""
-    env = os.environ.get("TARGET_DIR")
-    if env:
-        p = Path(env).expanduser().resolve()
-        if not p.is_dir():
-            sys.exit(f"TARGET_DIR={env} is not a directory")
-        return p
-    txt = REPO_ROOT / "target.txt"
-    if txt.is_file():
-        p = Path(txt.read_text().strip()).expanduser().resolve()
-        if not p.is_dir():
-            sys.exit(f"target.txt points to {p}, which is not a directory")
-        return p
-    sys.exit(
-        "No target configured. Set $TARGET_DIR or write the absolute path "
-        "into target.txt at the repo root."
-    )
+    """Back-compat shim for any caller that wants codebase mode only."""
+    t = target()
+    if t.mode != "codebase" or t.path is None:
+        sys.exit("target is configured as a URL — use prepare.target() instead")
+    return t.path
 
 
 # ---------- file walking ----------
@@ -320,6 +358,152 @@ def redact(text: str) -> str:
     for pat in _SECRET_PATTERNS:
         out = pat.sub(lambda m: m.group(0)[:6] + "…REDACTED", out)
     return out
+
+
+# ---------- polite HTTP probes (endpoint mode) ----------
+
+USER_AGENT = "autohack/0.1 (+https://github.com/anthropics/claude-code; static-recon)"
+
+# Hard caps. The agent CANNOT raise these from hack.py — endpoint mode is
+# explicitly "polite recon", not a fuzzer.
+PROBE_TIMEOUT_S = 10
+PROBE_BUDGET_PER_HOST = 25  # max requests per host per pass
+PROBE_MAX_BODY_BYTES = 256 * 1024  # 256 KB
+
+# Allowed probe paths. Anything not on this list requires explicit human
+# approval via env var ALLOW_EXTRA_PROBES=1 (still no auth, still no writes).
+WELL_KNOWN_PATHS = (
+    "/.well-known/openapi.json",
+    "/.well-known/openapi.yaml",
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/openid-configuration",
+    "/.well-known/jwks.json",
+    "/.well-known/security.txt",
+    "/.well-known/host-meta",
+    "/openapi.json",
+    "/openapi.yaml",
+    "/swagger.json",
+    "/swagger.yaml",
+    "/api-docs",
+    "/v1/openapi.json",
+    "/v2/openapi.json",
+    "/v3/api-docs",          # springdoc
+    "/api/v1/openapi.json",
+    "/api/swagger.json",
+    "/robots.txt",
+    "/sitemap.xml",
+)
+
+# Methods that are read-only and side-effect-free on conformant servers.
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+class ProbeBudgetExceeded(RuntimeError):
+    pass
+
+
+@dataclass
+class ProbeResult:
+    url: str
+    method: str
+    status: int | None
+    headers: dict[str, str] = field(default_factory=dict)
+    body_preview: str = ""        # first PROBE_MAX_BODY_BYTES, decoded best-effort
+    body_truncated: bool = False
+    error: str | None = None      # populated on network failure / timeout
+
+
+class ProbeSession:
+    """Polite HTTP session. Refuses non-safe methods, refuses to send any
+    Authorization / Cookie headers, hard-caps requests per host."""
+
+    def __init__(self) -> None:
+        if httpx is None:
+            raise RuntimeError("httpx not installed; cannot run endpoint mode")
+        self._client = httpx.Client(
+            timeout=PROBE_TIMEOUT_S,
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
+        )
+        self._spent: dict[str, int] = {}
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "ProbeSession":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def _charge(self, url: str) -> None:
+        host = urlparse(url).hostname or ""
+        n = self._spent.get(host, 0) + 1
+        self._spent[host] = n
+        if n > PROBE_BUDGET_PER_HOST:
+            raise ProbeBudgetExceeded(
+                f"per-host budget ({PROBE_BUDGET_PER_HOST}) exhausted for {host}"
+            )
+
+    def request(self, method: str, url: str) -> ProbeResult:
+        method = method.upper()
+        if method not in SAFE_METHODS:
+            return ProbeResult(url=url, method=method, status=None,
+                               error=f"refusing non-safe method {method}")
+        self._charge(url)
+        try:
+            r = self._client.request(method, url)
+        except httpx.HTTPError as e:
+            return ProbeResult(url=url, method=method, status=None, error=str(e))
+        body = r.content[:PROBE_MAX_BODY_BYTES]
+        try:
+            text = body.decode(r.encoding or "utf-8", errors="replace")
+        except (LookupError, TypeError):
+            text = body.decode("utf-8", errors="replace")
+        return ProbeResult(
+            url=str(r.url),
+            method=method,
+            status=r.status_code,
+            headers=dict(r.headers),
+            body_preview=text,
+            body_truncated=len(r.content) > PROBE_MAX_BODY_BYTES,
+        )
+
+    def get(self, url: str) -> ProbeResult: return self.request("GET", url)
+    def head(self, url: str) -> ProbeResult: return self.request("HEAD", url)
+    def options(self, url: str) -> ProbeResult: return self.request("OPTIONS", url)
+
+
+def probe_well_known(session: ProbeSession, base_url: str) -> list[ProbeResult]:
+    """Fetch every well-known discovery endpoint that exists. Skips 404/405
+    quickly; only kept results are returned."""
+    results: list[ProbeResult] = []
+    for path in WELL_KNOWN_PATHS:
+        url = base_url.rstrip("/") + path
+        try:
+            r = session.get(url)
+        except ProbeBudgetExceeded:
+            break
+        if r.status and 200 <= r.status < 400 and r.body_preview:
+            results.append(r)
+    return results
+
+
+def tls_san_names(host: str, port: int = 443) -> list[str]:
+    """Read the Subject Alternative Names from the TLS certificate. Useful
+    for discovering related hosts (e.g. api.foo.com -> *.foo.com)."""
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, port), timeout=5) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                cert = ssock.getpeercert() or {}
+        names = []
+        for typ, val in cert.get("subjectAltName", ()):
+            if typ.lower() == "dns":
+                names.append(val)
+        return names
+    except (socket.error, ssl.SSLError, OSError):
+        return []
 
 
 # ---------- summary printer (called by hack.py) ----------
