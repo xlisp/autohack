@@ -1,0 +1,8 @@
+findings/
+target.txt
+run.log
+.venv/
+__pycache__/
+*.pyc
+.uv/
+uv.lock
